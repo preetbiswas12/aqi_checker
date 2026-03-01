@@ -1,0 +1,1078 @@
+// ignore_for_file: unused_import, unused_field, unused_local_variable
+
+import 'dart:async';
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'secrets.dart';
+import 'services/waqi_service.dart';
+import 'services/gemini_service.dart';
+import 'package:flutter_markdown/flutter_markdown.dart';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+import 'package:http/http.dart' as http;
+import 'package:flutter_cache_manager/flutter_cache_manager.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:convert';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
+  runApp(const AeroGuardApp());
+}
+
+class AeroGuardApp extends StatelessWidget {
+  const AeroGuardApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'AeroGuard Agent',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
+        useMaterial3: true,
+      ),
+      home: const MapScreen(),
+    );
+  }
+}
+
+class MapScreen extends StatefulWidget {
+  const MapScreen({super.key});
+
+  @override
+  State<MapScreen> createState() => _MapScreenState();
+}
+
+class _MapScreenState extends State<MapScreen> {
+  int _userPoints = 0;
+  static const bool enableHeatmap = true;
+  static const bool enableRouting = true;
+  List<Map<String, dynamic>> _hazardData = [];
+
+  final Completer<GoogleMapController> _controller = Completer();
+  final GeminiService _geminiService = GeminiService();
+  final TextEditingController _textController = TextEditingController();
+  final ImagePicker _picker = ImagePicker();
+  final Set<Marker> _reportMarkers = {};
+
+  static const LatLng _initialPosition = LatLng(28.3639, 77.5360);
+  LatLng? _currentPosition;
+
+  final Set<Polyline> _polylines = {};
+  final Set<Marker> _markers = {};
+  final Set<TileOverlay> _tileOverlays = {};
+  bool _isCardExpanded = true;
+  bool _showHeatmap = true;
+  bool _isVerifyingReport = false;
+
+  bool _isLoading = true;
+  bool _isAgentThinking = false;
+  String _agentResponse =
+      "I am monitoring the air quality around you. Planning to go somewhere?";
+
+  int? _startAqi;
+  int? _destAqi;
+
+  @override
+  void initState() {
+    super.initState();
+    // Real-time hazards listener (updates markers for everyone)
+    _listenToHazards();
+    // Keep local user data for points and persisted settings
+    _loadUserData();
+    if (enableHeatmap) {
+      _initializeHeatmap();
+    }
+    _initializeSystem();
+  }
+
+  Future<void> _savePoints() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('user_points', _userPoints);
+  }
+
+  void _createMarkerFromData(Map<String, dynamic> report) {
+    final String id = report['id'];
+    final LatLng position = LatLng(report['lat'], report['lng']);
+    final String type = report['type'];
+
+    final marker = Marker(
+      markerId: MarkerId(id),
+      position: position,
+      icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueOrange),
+      // Verify report when marker is tapped
+      onTap: () {
+        _showVerifyDialog(id, type);
+      },
+    );
+
+    _reportMarkers.add(marker);
+  }
+
+  void _showVerifyDialog(String id, String type) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text("Verify $type"),
+        content: const Text("Is this hazard still present?"),
+        actions: [
+          TextButton(
+            onPressed: () async {
+              // DELETE FROM CLOUD
+              try {
+                await FirebaseFirestore.instance
+                    .collection('hazards')
+                    .doc(id)
+                    .delete();
+              } catch (e) {
+                // ignore errors
+              }
+
+              Navigator.pop(ctx);
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text("Hazard cleared for everyone.")),
+              );
+            },
+            child: const Text(
+              "No (Clear It)",
+              style: TextStyle(color: Colors.red),
+            ),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.teal),
+            child: const Text(
+              "Yes (Still Here)",
+              style: TextStyle(color: Colors.white),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Load reports from disk on startup
+  Future<void> _loadUserData() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    final String? storedReports = prefs.getString('hazard_reports');
+    if (storedReports != null) {
+      final List<dynamic> decoded = json.decode(storedReports);
+      setState(() {
+        _hazardData = decoded.cast<Map<String, dynamic>>();
+        _reportMarkers.clear();
+        for (var report in _hazardData) {
+          _createMarkerFromData(report);
+        }
+      });
+    }
+
+    setState(() {
+      _userPoints = prefs.getInt('user_points') ?? 0;
+    });
+  }
+
+  // Save current list to disk
+  Future<void> _saveReports() async {
+    final prefs = await SharedPreferences.getInstance();
+    final String encoded = json.encode(_hazardData);
+    await prefs.setString('hazard_reports', encoded);
+  }
+
+  // REAL-TIME LISTENER: Updates map whenever ANYONE reports a hazard
+  void _listenToHazards() {
+    FirebaseFirestore.instance
+        .collection('hazards')
+        .snapshots() // This stream gives us updates instantly
+        .listen((snapshot) {
+          setState(() {
+            _reportMarkers.clear(); // Clear old markers
+
+            for (var doc in snapshot.docs) {
+              final data = doc.data();
+              final String id = doc.id; // Firestore Document ID
+
+              final double lat = (data['lat'] as num).toDouble();
+              final double lng = (data['lng'] as num).toDouble();
+
+              // Create Marker from Firestore Data
+              final marker = Marker(
+                markerId: MarkerId(id),
+                position: LatLng(lat, lng),
+                icon: BitmapDescriptor.defaultMarkerWithHue(
+                  BitmapDescriptor.hueOrange,
+                ),
+                onTap: () => _showVerifyDialog(
+                  id,
+                  (data['type'] ?? 'Hazard').toString(),
+                ),
+              );
+
+              _reportMarkers.add(marker);
+            }
+          });
+        });
+  }
+
+  Future<void> _handleReport() async {
+    // Pick image from camera
+    final XFile? photo = await _picker.pickImage(source: ImageSource.camera);
+    if (photo == null) return;
+
+    // Open a dialog to get report details
+    if (mounted) {
+      _showReportDialog(File(photo.path));
+    }
+  }
+
+  void _showReportDialog(File imageFile) {
+    final TextEditingController reportController = TextEditingController();
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(20),
+              ),
+              title: Row(
+                children: const [
+                  Icon(Icons.warning_amber_rounded, color: Colors.orange),
+                  SizedBox(width: 10),
+                  Text("Report Hazard"),
+                ],
+              ),
+              // Wrap content in SingleChildScrollView to prevent overflow
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(12),
+                      child: Image.file(
+                        imageFile,
+                        height: 150,
+                        width: double.infinity,
+                        fit: BoxFit.cover,
+                      ),
+                    ),
+                    const SizedBox(height: 15),
+
+                    TextField(
+                      controller: reportController,
+                      enabled: !_isVerifyingReport,
+                      decoration: InputDecoration(
+                        hintText: "What do you see? (e.g. Smoke)",
+                        filled: true,
+                        fillColor: Colors.grey.shade100,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                    ),
+
+                    if (_isVerifyingReport) ...[
+                      const SizedBox(height: 20),
+                      const LinearProgressIndicator(
+                        color: Colors.teal,
+                        backgroundColor: Colors.black12,
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        "Agent is verifying evidence...",
+                        style: TextStyle(fontSize: 12, color: Colors.grey),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              actions: [
+                if (!_isVerifyingReport)
+                  TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text(
+                      "Cancel",
+                      style: TextStyle(color: Colors.grey),
+                    ),
+                  ),
+
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: _isVerifyingReport
+                        ? Colors.grey
+                        : Colors.teal,
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(30),
+                    ),
+                  ),
+                  onPressed: _isVerifyingReport
+                      ? null
+                      : () async {
+                          if (reportController.text.isEmpty) return;
+
+                          // Dismiss keyboard to free up screen space
+                          FocusScope.of(context).unfocus();
+
+                          setDialogState(() {
+                            _isVerifyingReport = true;
+                          });
+
+                          // Demo delay
+                          await Future.delayed(const Duration(seconds: 2));
+
+                          final result = await _geminiService
+                              .analyzePollutionImage(
+                                imageFile,
+                                reportController.text,
+                              );
+
+                          if (mounted) {
+                            Navigator.pop(context);
+                            setState(() {
+                              _isVerifyingReport = false;
+                            });
+
+                            if (result['verified'] == true) {
+                              _addHazardMarker(result['type']);
+                            } else {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text(
+                                    "❌ Agent could not verify the hazard.",
+                                  ),
+                                ),
+                              );
+                            }
+                          }
+                        },
+                  child: const Text("Verify & Report"),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void _addHazardMarker(String type) {
+    if (_currentPosition == null) return;
+
+    // 1. Write to Firestore
+    FirebaseFirestore.instance.collection('hazards').add({
+      'type': type,
+      'lat': _currentPosition!.latitude,
+      'lng': _currentPosition!.longitude,
+      'timestamp': FieldValue.serverTimestamp(), // Use Server Time
+      'verified': true,
+    });
+
+    // 2. Local Rewards (Keep this local for simplicity in MVP)
+    setState(() {
+      _userPoints += 10;
+    });
+    _savePoints();
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const Icon(Icons.cloud_upload, color: Colors.white),
+            const SizedBox(width: 10),
+            Text("Report uploaded! +10 Points"),
+          ],
+        ),
+        backgroundColor: Colors.teal,
+      ),
+    );
+
+    // Note: We DON'T need to manually add to _reportMarkers here.
+    // The _listenToHazards() function will see the new data and update the map automatically!
+  }
+
+  void _initializeHeatmap() {
+    final String overlayId = DateTime.now().millisecondsSinceEpoch.toString();
+
+    final TileOverlay tileOverlay = TileOverlay(
+      tileOverlayId: TileOverlayId(overlayId),
+      tileProvider: WaqiTileProvider(Secrets.waqiApiKey),
+      transparency: 0.2,
+      zIndex: 999,
+    );
+
+    setState(() {
+      _tileOverlays.add(tileOverlay);
+    });
+  }
+
+  Future<void> _initializeSystem() async {
+    await _geminiService.init();
+
+    _geminiService.onRouteFound =
+        (
+          List<List<LatLng>> allRoutes,
+          double? destLat,
+          double? destLng,
+          int? destAqi,
+        ) async {
+          if (!enableRouting) return;
+
+          int? currentAqi;
+          if (_currentPosition != null) {
+            try {
+              final currentData = await WaqiService().getAirQuality(
+                _currentPosition!.latitude,
+                _currentPosition!.longitude,
+              );
+              currentAqi = currentData['aqi'] is int
+                  ? currentData['aqi'] as int
+                  : null;
+            } catch (e) {
+              print("WAQI fetch error (current): $e");
+            }
+          }
+
+          setState(() {
+            _polylines.clear();
+            _markers.clear();
+
+            // Auto-hide heatmap when routing
+            if (enableHeatmap) {
+              _showHeatmap = false;
+            }
+
+            _startAqi = currentAqi;
+            _destAqi = destAqi;
+
+            for (int i = 0; i < allRoutes.length; i++) {
+              final isGreenRoute = (i == 1);
+
+              _polylines.add(
+                Polyline(
+                  polylineId: PolylineId('route_$i'),
+                  points: allRoutes[i],
+                  color: isGreenRoute ? Colors.green : Colors.blueAccent,
+                  width: isGreenRoute ? 7 : 5,
+                  zIndex: isGreenRoute ? 2 : 1,
+                ),
+              );
+            }
+
+            if (destLat != null && destLng != null) {
+              _markers.add(
+                Marker(
+                  markerId: const MarkerId('destination'),
+                  position: LatLng(destLat, destLng),
+                  icon: BitmapDescriptor.defaultMarkerWithHue(
+                    BitmapDescriptor.hueRed,
+                  ),
+                  infoWindow: InfoWindow(
+                    title: "Destination",
+                    snippet: "AQI: ${destAqi ?? '--'}",
+                  ),
+                ),
+              );
+            }
+          });
+
+          if (allRoutes.isNotEmpty) {
+            final controller = await _controller.future;
+            try {
+              await controller.animateCamera(
+                CameraUpdate.newLatLngBounds(
+                  _boundsFromLatLngList(allRoutes[0]),
+                  50,
+                ),
+              );
+            } catch (_) {}
+          }
+        };
+
+    await _checkPermissionsAndLocate();
+  }
+
+  Future<void> _checkPermissionsAndLocate() async {
+    var status = await Permission.location.request();
+
+    if (status.isGranted) {
+      Position position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+
+      int? fetchedAqi;
+      try {
+        final aqiData = await WaqiService().getAirQuality(
+          position.latitude,
+          position.longitude,
+        );
+        fetchedAqi = aqiData['aqi'] is int ? aqiData['aqi'] : null;
+      } catch (e) {
+        print("Startup AQI Error: $e");
+      }
+
+      setState(() {
+        _currentPosition = LatLng(position.latitude, position.longitude);
+        _startAqi = fetchedAqi;
+        _isLoading = false;
+      });
+
+      _geminiService.updateLocation(position.latitude, position.longitude);
+
+      final GoogleMapController controller = await _controller.future;
+      controller.animateCamera(
+        CameraUpdate.newCameraPosition(
+          CameraPosition(target: _currentPosition!, zoom: 14),
+        ),
+      );
+    } else {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _performReset({bool clearPoints = false}) async {
+    setState(() {
+      _polylines.clear();
+      _markers.clear();
+      _startAqi = null;
+      _destAqi = null;
+      _showHeatmap = true;
+      _agentResponse =
+          "I am monitoring the air quality around you. Had a change of mind on going out?";
+      _isCardExpanded = true;
+
+      // Reset logic
+      if (clearPoints) {
+        _userPoints = 0;
+        _savePoints(); // Clear from disk
+      }
+    });
+
+    // Re-center map
+    if (_currentPosition != null) {
+      final controller = await _controller.future;
+      controller.animateCamera(
+        CameraUpdate.newCameraPosition(
+          CameraPosition(target: _currentPosition!, zoom: 14),
+        ),
+      );
+    }
+  }
+
+  Future<void> _handleUserQuery() async {
+    if (_textController.text.isEmpty) return;
+    FocusScope.of(context).unfocus();
+
+    final query = _textController.text;
+    setState(() {
+      _isCardExpanded = true;
+      _isAgentThinking = true;
+      _textController.clear();
+    });
+
+    final response = await _geminiService.sendMessage(query);
+
+    setState(() {
+      _agentResponse = response;
+      _isAgentThinking = false;
+    });
+  }
+
+  void _showResetDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("Reset App"),
+        content: const Text(
+          "Do you want to clear your current session or reset everything including your earned points?",
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              _performReset(clearPoints: false);
+            },
+            child: const Text(
+              "Clear Map Only",
+              style: TextStyle(color: Colors.teal),
+            ),
+          ),
+
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              _performReset(clearPoints: true);
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text("App fully reset (Points cleared)."),
+                ),
+              );
+            },
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            child: const Text(
+              "Full Factory Reset",
+              style: TextStyle(color: Colors.white),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  LatLngBounds _boundsFromLatLngList(List<LatLng> list) {
+    double? x0, x1, y0, y1;
+    for (LatLng latLng in list) {
+      if (x0 == null) {
+        x0 = x1 = latLng.latitude;
+        y0 = y1 = latLng.longitude;
+      } else {
+        if (latLng.latitude > x1!) x1 = latLng.latitude;
+        if (latLng.latitude < x0!) x0 = latLng.latitude;
+        if (latLng.longitude > y1!) y1 = latLng.longitude;
+        if (latLng.longitude < y0!) y0 = latLng.longitude;
+      }
+    }
+    return LatLngBounds(
+      northeast: LatLng(x1!, y1!),
+      southwest: LatLng(x0!, y0!),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Stack(
+        children: [
+          GoogleMap(
+            mapType: MapType.normal,
+            minMaxZoomPreference: const MinMaxZoomPreference(0, 15),
+            initialCameraPosition: const CameraPosition(
+              target: _initialPosition,
+              zoom: 12,
+            ),
+            polylines: _polylines,
+            markers: _markers.union(_reportMarkers),
+            // Only show heatmap tiles if feature enabled
+            tileOverlays: (enableHeatmap && _showHeatmap) ? _tileOverlays : {},
+            myLocationEnabled: true,
+            myLocationButtonEnabled: false,
+            zoomControlsEnabled: false,
+            onMapCreated: (GoogleMapController controller) {
+              _controller.complete(controller);
+            },
+          ),
+
+          Positioned(top: 0, left: 0, right: 0, child: _buildFloatingHeader()),
+          Positioned(bottom: 30, left: 16, right: 16, child: _buildAgentCard()),
+
+          if (_isLoading)
+            Container(
+              color: Colors.white,
+              width: double.infinity,
+              height: double.infinity,
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.eco, size: 80, color: Colors.teal),
+                  const SizedBox(height: 20),
+                  const Text(
+                    "AeroGuard",
+                    style: TextStyle(
+                      fontSize: 32,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.teal,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    "Breathe Smarter",
+                    style: TextStyle(
+                      fontSize: 16,
+                      color: Colors.teal.shade700,
+                      letterSpacing: 1.2,
+                    ),
+                  ),
+                  const SizedBox(height: 50),
+                  const CircularProgressIndicator(color: Colors.teal),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFloatingHeader() {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          crossAxisAlignment: CrossAxisAlignment.start, // Align to top
+          children: [
+            // Left: status and points
+            Flexible(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Status card
+                  Card(
+                    elevation: 4,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(30),
+                    ),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(30),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.cloud_outlined, color: Colors.teal),
+                          if (_startAqi != null) ...[
+                            const SizedBox(width: 10),
+                            Container(
+                              width: 1,
+                              height: 20,
+                              color: Colors.grey.shade300,
+                            ),
+                            const SizedBox(width: 10),
+                            Text(
+                              "AQI $_startAqi",
+                              style: TextStyle(
+                                color: _getColorForAqi(_startAqi!),
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+
+                  // Gamification badge
+                  if (_userPoints > 0) ...[
+                    const SizedBox(height: 6), // Tiny gap
+                    Card(
+                      elevation: 4,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.amber.shade100,
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(
+                              Icons.stars,
+                              size: 16,
+                              color: Colors.deepOrange,
+                            ),
+                            const SizedBox(width: 5),
+                            Text(
+                              "$_userPoints Pts",
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 12,
+                                color: Colors.deepOrange,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+
+            const SizedBox(width: 8),
+
+            // Right: action buttons
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (enableHeatmap) ...[
+                  FloatingActionButton.small(
+                    heroTag: "heatmap_toggle",
+                    backgroundColor: _showHeatmap ? Colors.teal : Colors.white,
+                    child: Icon(
+                      Icons.layers,
+                      color: _showHeatmap ? Colors.white : Colors.black54,
+                    ),
+                    onPressed: () =>
+                        setState(() => _showHeatmap = !_showHeatmap),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+
+                FloatingActionButton.small(
+                  heroTag: "report_btn",
+                  backgroundColor: Colors.orange,
+                  child: const Icon(Icons.camera_alt, color: Colors.white),
+                  onPressed: _handleReport,
+                ),
+
+                if (enableRouting) ...[
+                  const SizedBox(width: 8),
+                  FloatingActionButton.small(
+                    heroTag: "reset_btn",
+                    backgroundColor: Colors.white,
+                    child: const Icon(Icons.refresh, color: Colors.black54),
+                    onPressed: _showResetDialog, // Changed to call dialog
+                  ),
+                ],
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Color _getColorForAqi(int aqi) {
+    if (aqi <= 50) return Colors.green;
+    if (aqi <= 100) return Colors.amber;
+    if (aqi <= 150) return Colors.orange;
+    return Colors.red;
+  }
+
+  Widget _buildAqiColumn(String label, int? aqi) {
+    return Column(
+      children: [
+        Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey)),
+        const SizedBox(height: 4),
+        Text(
+          "${aqi ?? '--'}",
+          style: TextStyle(
+            fontSize: 20,
+            fontWeight: FontWeight.bold,
+            color: _getColorForAqi(aqi ?? 0),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAgentCard() {
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeInOut,
+      constraints: BoxConstraints(
+        minHeight: 85,
+        maxHeight: _isCardExpanded ? 500 : 85,
+      ),
+      child: Card(
+        elevation: 8,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        margin: EdgeInsets.zero,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: SingleChildScrollView(
+            physics: const ClampingScrollPhysics(),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.shield, color: Colors.teal, size: 28),
+                    const SizedBox(width: 10),
+                    const Text(
+                      "AeroGuard",
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const Spacer(),
+                    IconButton(
+                      icon: Icon(
+                        _isCardExpanded
+                            ? Icons.keyboard_arrow_down
+                            : Icons.keyboard_arrow_up,
+                      ),
+                      onPressed: () {
+                        setState(() {
+                          _isCardExpanded = !_isCardExpanded;
+                        });
+                      },
+                    ),
+                  ],
+                ),
+
+                if (_isCardExpanded) ...[
+                  const SizedBox(height: 5),
+                  if (_isAgentThinking)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 15),
+                      child: LinearProgressIndicator(
+                        backgroundColor: Colors.teal.shade50,
+                        color: Colors.teal,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+
+                  // Only show trip stats if routing is enabled
+                  if (enableRouting &&
+                      _destAqi != null &&
+                      !_isAgentThinking) ...[
+                    Container(
+                      margin: const EdgeInsets.only(bottom: 12),
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.teal.shade50,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: Colors.teal.shade100),
+                      ),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceAround,
+                        children: [
+                          _buildAqiColumn("Start", _startAqi),
+                          const Icon(Icons.arrow_forward, color: Colors.grey),
+                          _buildAqiColumn("Destination", _destAqi),
+                        ],
+                      ),
+                    ),
+                  ],
+
+                  FadeInText(
+                    key: ValueKey(_agentResponse),
+                    child: MarkdownBody(
+                      data: _agentResponse,
+                      styleSheet: MarkdownStyleSheet(
+                        p: const TextStyle(color: Colors.black87, fontSize: 15),
+                        strong: const TextStyle(
+                          color: Colors.teal,
+                          fontWeight: FontWeight.bold,
+                        ),
+                        listBullet: const TextStyle(color: Colors.teal),
+                      ),
+                    ),
+                  ),
+
+                  const SizedBox(height: 20),
+                  TextField(
+                    controller: _textController,
+                    onSubmitted: (_) => _handleUserQuery(),
+                    decoration: InputDecoration(
+                      hintText: "Ask me...",
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 20,
+                      ),
+                      filled: true,
+                      fillColor: Colors.grey.shade200,
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(30),
+                        borderSide: BorderSide.none,
+                      ),
+                      suffixIcon: IconButton(
+                        icon: const Icon(Icons.send, color: Colors.teal),
+                        onPressed: _handleUserQuery,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 5),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// WaqiTileProvider: cached tile provider
+class WaqiTileProvider implements TileProvider {
+  final String apiKey;
+  // Use the default cache manager to store/retrieve files
+  final BaseCacheManager _cacheManager = DefaultCacheManager();
+
+  WaqiTileProvider(this.apiKey);
+
+  @override
+  Future<Tile> getTile(int x, int y, int? zoom) async {
+    // Zoom clamp: WAQI provides tiles up to ~zoom 15-16
+    // Return noTile for higher zooms to avoid unnecessary requests
+    if (zoom == null || zoom > 16) return TileProvider.noTile;
+
+    final url =
+        "https://tiles.waqi.info/tiles/usepa-aqi/$zoom/$x/$y.png?token=$apiKey";
+
+    try {
+      // getSingleFile checks the cache first, then falls back to network
+      final File file = await _cacheManager.getSingleFile(
+        url,
+        headers: {'User-Agent': 'AeroGuard/1.0 (Flutter)'},
+      );
+
+      final Uint8List bytes = await file.readAsBytes();
+      return Tile(256, 256, bytes);
+    } catch (e) {
+      // On failure, return no tile to avoid map lag
+      return TileProvider.noTile;
+    }
+  }
+}
+
+class FadeInText extends StatefulWidget {
+  final Widget child;
+  const FadeInText({super.key, required this.child});
+
+  @override
+  State<FadeInText> createState() => _FadeInTextState();
+}
+
+class _FadeInTextState extends State<FadeInText>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<double> _opacity;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      duration: const Duration(milliseconds: 800),
+      vsync: this,
+    );
+    _opacity = CurvedAnimation(parent: _controller, curve: Curves.easeIn);
+    _controller.forward();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(opacity: _opacity, child: widget.child);
+  }
+}

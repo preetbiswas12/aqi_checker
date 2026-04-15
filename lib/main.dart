@@ -23,16 +23,16 @@ import 'dart:convert';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp();
-  runApp(const AeroGuardApp());
+  runApp(const AQICheckerApp());
 }
 
-class AeroGuardApp extends StatelessWidget {
-  const AeroGuardApp({super.key});
+class AQICheckerApp extends StatelessWidget {
+  const AQICheckerApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'AeroGuard Agent',
+      title: 'AQI Checker',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
@@ -687,7 +687,7 @@ class _MapScreenState extends State<MapScreen> {
                   const Icon(Icons.eco, size: 80, color: Colors.teal),
                   const SizedBox(height: 20),
                   const Text(
-                    "AeroGuard",
+                    "AQI Checker",
                     style: TextStyle(
                       fontSize: 32,
                       fontWeight: FontWeight.bold,
@@ -904,7 +904,7 @@ class _MapScreenState extends State<MapScreen> {
                     const Icon(Icons.shield, color: Colors.teal, size: 28),
                     const SizedBox(width: 10),
                     const Text(
-                      "AeroGuard",
+                      "AQI Checker",
                       style: TextStyle(
                         fontSize: 18,
                         fontWeight: FontWeight.bold,
@@ -1029,7 +1029,7 @@ class WaqiTileProvider implements TileProvider {
       // getSingleFile checks the cache first, then falls back to network
       final File file = await _cacheManager.getSingleFile(
         url,
-        headers: {'User-Agent': 'AeroGuard/1.0 (Flutter)'},
+        headers: {'User-Agent': 'AQI-Checker/1.0 (Flutter)'},
       );
 
       final Uint8List bytes = await file.readAsBytes();

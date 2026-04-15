@@ -58,7 +58,7 @@ class GeminiService {
       ],
       // UPDATED PROMPT: Forces comparison logic
       systemInstruction: Content.system(
-        'You are AeroGuard. You have location access. NEVER ask for it. '
+        'You are AQI Checker. You have location access. NEVER ask for it. '
         '1. Safety Queries: Call `get_current_air_quality`. Response: Summary + 3 bullets. '
         '2. Trip Planning: Call `plan_trip_to_destination`. '
         '   - IF 2 ROUTES FOUND: You MUST list both options with their duration. '

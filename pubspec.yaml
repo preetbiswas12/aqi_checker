@@ -1,5 +1,6 @@
-name: aeroguard_agent
-description: "A new Flutter project."
+name: aqi_checker
+description: "A real-time air quality monitoring application with AI-powered recommendations."
+author: preet biswas
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: "none" # Remove this line if you wish to publish to pub.dev
@@ -34,33 +35,16 @@ dependencies:
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
-
-  # ✅ FREE MAPS - OpenStreetMap with Flutter Map (RECOMMENDED)
-  flutter_map: ^6.0.0
-  latlong2: ^0.9.0
-
-  # 💰 OPTIONAL: Google Maps (PAID - uncomment if needed)
-  # google_maps_flutter: ^2.14.0
-  # flutter_polyline_points: ^3.1.0
-
-  # 💰 PAID Maps Alternative:
-  # Uncomment above and set Secrets.useGoogleMaps = true to use Google Maps
-
-  # AI & APIs
-  google_generative_ai: ^0.4.7  # FREE - Gemini AI from Google AI Studio
-  http: ^1.6.0
-
-  # Location & Permissions
+  google_maps_flutter: ^2.14.0
+  google_generative_ai: ^0.4.7
   geolocator: ^14.0.2
-  permission_handler: ^12.0.1
-
-  # UI & Data
+  http: ^1.6.0
   shared_preferences: ^2.5.4
+  flutter_polyline_points: ^3.1.0
+  permission_handler: ^12.0.1
   flutter_markdown: ^0.7.7+1
   flutter_cache_manager: ^3.3.1
   image_picker: ^1.0.7
-
-  # Firebase (FREE Spark Plan)
   firebase_core: ^2.24.2
   cloud_firestore: ^4.14.0
 
